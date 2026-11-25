@@ -13,14 +13,18 @@
     * { box-sizing: border-box; }
     html, body { width: 100%; height: 100%; margin: 0; overflow: hidden; }
     body { display: grid; place-items: center; background: radial-gradient(ellipse at 50% 35%, #f7fdff 0%, #e5f7fc 56%, #cdebf4 100%); }
-    main { width: min(100vw, 66.6667vh); height: min(100vh, 150vw); height: min(100dvh, 150vw); display: grid; place-items: center; padding: 12px; }
+    main { position: relative; width: min(100vw, 66.6667vh); height: min(100vh, 150vw); height: min(100dvh, 150vw); display: grid; place-items: center; padding: 12px; }
     canvas { display: block; width: 100%; height: 100%; max-width: 480px; max-height: 720px; border-radius: 24px; box-shadow: 0 24px 70px #25667b30, 0 3px 12px #25667b1c; touch-action: none; }
+    #player-name { position: absolute; z-index: 2; top: 44.5%; left: 25%; width: 50%; height: 6%; min-height: 38px; border: 2px solid #c6e5e7; border-radius: 14px; padding: 0 12px; background: #fff; color: #174b5d; font: 800 clamp(14px, 3.4vw, 17px) "Nunito", system-ui, sans-serif; text-align: center; outline: none; }
+    #player-name:focus { border-color: #46b8c8; box-shadow: 0 0 0 4px #46b8c833; }
+    #player-name::placeholder { color: #88aeb2; }
     @media (max-aspect-ratio: 2/3) { main { width: 100vw; height: 150vw; max-height: 100dvh; } canvas { border-radius: 0; } }
   </style>
 </head>
 <body>
 <main aria-label="Skybound canvas game">
   <canvas id="game" width="480" height="720" aria-label="Flappy Bird-style game. Tap, click, or press Space to flap."></canvas>
+  <input id="player-name" maxlength="18" autocomplete="nickname" placeholder="Enter your name" aria-label="Enter your name before playing">
 </main>
 <script>
 (() => {
@@ -40,9 +44,14 @@
   const W = 480, H = 720, GROUND_Y = H - SETTINGS.groundHeight;
   const canvas = document.querySelector("#game");
   const ctx = canvas.getContext("2d");
+  const nameInput = document.querySelector("#player-name");
   const rand = (a, b) => a + Math.random() * (b - a);
   let mode = "ready"; // ready | playing | paused | over
   let score = 0, best = Number(localStorage.getItem("skybound-best") || 0);
+  let playerName = localStorage.getItem("skybound-name") || "";
+  let leaderboard = JSON.parse(localStorage.getItem("skybound-leaderboard") || "[]");
+  let showLeaderboard = false, nameRequired = false;
+  nameInput.value = playerName;
   let bird = { x: 132, y: 310, vy: 0, rotation: 0, wing: 0 };
   let pipes = [], elapsed = 0, groundOffset = 0;
   let muted = false, audio = null, lastTime = 0;
@@ -68,6 +77,9 @@
     } catch (_) { /* Audio is an optional enhancement. */ }
   }
   function startGame() {
+    playerName = nameInput.value.trim().slice(0, 18);
+    if (!playerName) { nameRequired = true; nameInput.focus(); return; }
+    nameRequired = false; localStorage.setItem("skybound-name", playerName);
     score = 0; elapsed = 0; pipes = [];
     bird = { x: 132, y: 310, vy: 0, rotation: 0, wing: 0 };
     pipes.push(makePipe(W + 30));
@@ -83,9 +95,13 @@
     if (mode !== "playing") return;
     mode = "over"; sound("hit");
     if (score > best) { best = score; localStorage.setItem("skybound-best", String(best)); }
+    leaderboard.push({ name: playerName || "Player", score });
+    leaderboard.sort((a, b) => b.score - a.score);
+    leaderboard = leaderboard.slice(0, 50);
+    localStorage.setItem("skybound-leaderboard", JSON.stringify(leaderboard));
   }
   function act() {
-    if (mode === "ready" || mode === "over") { startGame(); return; }
+    if (mode === "ready" || mode === "over") { if (showLeaderboard) return; startGame(); return; }
     if (mode === "playing") flap();
     else if (mode === "paused") { mode = "playing"; lastTime = performance.now(); }
   }
@@ -159,6 +175,8 @@
   }
   function draw() {
     buttons.pause = buttons.mute = buttons.restart = null;
+    buttons.leaderboard = buttons.back = null;
+    nameInput.style.display = mode === "ready" && !showLeaderboard ? "block" : "none";
     const sky = ctx.createLinearGradient(0, 0, 0, H); sky.addColorStop(0, "#62cce8"); sky.addColorStop(.65, "#a6e9ed"); sky.addColorStop(1, "#d4f3d5");
     ctx.fillStyle = sky; ctx.fillRect(0, 0, W, H);
     // distant soft sun and cloud layers
@@ -173,13 +191,28 @@
       button("mute", muted ? "♪  OFF" : "♪  ON", W - 112, 22, 90, 44);
     }
     if (mode === "ready") {
+      button("leaderboard", "🏆 SCORES", W - 148, 22, 126, 44, "#ffffff");
       rounded(36, 174, W - 72, 315, 30, "#ffffffdf");
       text("SKYBOUND", W / 2, 230, 45, "#1487a0");
       text("A LITTLE FLIGHT OF FANCY", W / 2, 270, 13, "#5f929d", 800);
       drawBird();
-      text("TAP / PRESS SPACE", W / 2, 394, 22, "#174b5d");
-      text("TO START", W / 2, 422, 18, "#4d8993", 800);
-      rounded(145, 447, 190, 30, 15, "#fff2c8"); text(`BEST  ${best}`, W / 2, 462, 16, "#946b2d", 900);
+      text(nameRequired ? "PLEASE ENTER YOUR NAME" : "TAP / PRESS SPACE TO START", W / 2, 390, nameRequired ? 16 : 17, nameRequired ? "#d66c55" : "#174b5d");
+      rounded(145, 425, 190, 30, 15, "#fff2c8"); text(`BEST  ${best}`, W / 2, 440, 16, "#946b2d", 900);
+      if (showLeaderboard) {
+        rounded(44, 128, W - 88, 438, 28, "#fffffff2");
+        text("LEADERBOARD", W / 2, 174, 30, "#1487a0");
+        text("RANK", 105, 219, 13, "#76a3a8", 900); text("PLAYER", 230, 219, 13, "#76a3a8", 900); text("SCORE", 355, 219, 13, "#76a3a8", 900);
+        const rows = leaderboard.slice(0, 10);
+        if (!rows.length) text("No scores yet — take the first flight!", W / 2, 280, 15, "#648b91", 800);
+        rows.forEach((row, i) => {
+          const y = 250 + i * 28;
+          if (i % 2 === 0) rounded(72, y - 12, W - 144, 25, 8, "#edf8f7");
+          text(String(i + 1), 105, y, 14, "#54868e", 800);
+          text(row.name.length > 13 ? row.name.slice(0, 12) + "…" : row.name, 230, y, 14, "#174b5d", 800);
+          text(String(row.score), 355, y, 15, "#1487a0");
+        });
+        button("back", "BACK", 170, 510, 140, 42, "#ffcf4b");
+      }
     }
     if (mode === "paused") {
       rounded(86, 271, W - 172, 142, 26, "#ffffffed"); text("PAUSED", W / 2, 313, 34, "#1487a0"); text("Press P or tap to continue", W / 2, 359, 16, "#527d86", 800);
@@ -199,13 +232,18 @@
     if (hitButton(p, "mute")) { muted = !muted; draw(); return; }
     if (hitButton(p, "pause")) { togglePause(); draw(); return; }
     if (hitButton(p, "restart")) { startGame(); draw(); return; }
+    if (hitButton(p, "leaderboard")) { showLeaderboard = true; draw(); return; }
+    if (hitButton(p, "back")) { showLeaderboard = false; draw(); return; }
     act(); draw();
   });
   window.addEventListener("keydown", e => {
+    if (e.code === "Enter" && mode === "ready" && showLeaderboard) { showLeaderboard = false; draw(); return; }
+    if (e.code === "Enter" && mode === "ready" && document.activeElement === nameInput) { e.preventDefault(); startGame(); draw(); return; }
     if (e.code === "Space" || e.code === "ArrowUp") { e.preventDefault(); if (!e.repeat) act(); }
     else if (e.key.toLowerCase() === "p" && (mode === "playing" || mode === "paused")) togglePause();
     else if (e.key.toLowerCase() === "m") muted = !muted;
   });
+  nameInput.addEventListener("input", () => { nameRequired = false; });
   function frame(now) {
     const dt = lastTime ? Math.min((now - lastTime) / 1000, .035) : 0;
     lastTime = now; update(dt); draw(); requestAnimationFrame(frame);
