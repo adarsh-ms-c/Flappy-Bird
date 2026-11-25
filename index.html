@@ -16,8 +16,8 @@
     main { position: relative; width: min(100vw, 66.6667vh); height: min(100vh, 150vw); height: min(100dvh, 150vw); display: grid; place-items: center; padding: 12px; }
     canvas { display: block; width: 100%; height: 100%; max-width: 480px; max-height: 720px; border-radius: 24px; box-shadow: 0 24px 70px #25667b30, 0 3px 12px #25667b1c; touch-action: none; }
     .player-field { position: absolute; z-index: 2; left: 25%; width: 50%; height: 5.8%; min-height: 37px; border: 2px solid #c6e5e7; border-radius: 14px; padding: 0 12px; background: #fff; color: #174b5d; font: 800 clamp(13px, 3.3vw, 16px) "Nunito", system-ui, sans-serif; text-align: center; outline: none; }
-    #player-name { top: 42%; }
-    #player-dob { top: 48.8%; }
+    #player-name { top: 44%; }
+    #player-name.editing { top: 53%; }
     .player-field:focus { border-color: #46b8c8; box-shadow: 0 0 0 4px #46b8c833; }
     .player-field::placeholder { color: #88aeb2; }
     @media (max-aspect-ratio: 2/3) { main { width: 100vw; height: 150vw; max-height: 100dvh; } canvas { border-radius: 0; } }
@@ -26,12 +26,16 @@
 <body>
 <main aria-label="Skybound canvas game">
   <canvas id="game" width="480" height="720" aria-label="Flappy Bird-style game. Tap, click, or press Space to flap."></canvas>
-  <input class="player-field" id="player-name" maxlength="18" autocomplete="nickname" placeholder="Enter a unique name" aria-label="Enter your name before playing">
-  <input class="player-field" id="player-dob" type="date" autocomplete="off" aria-label="Date of birth (kept private)" title="Date of birth is not saved or shown on the leaderboard">
+  <input class="player-field" id="player-name" maxlength="12" autocomplete="nickname" placeholder="Username (3-12 characters)" aria-label="Choose a username">
 </main>
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
 <script>
 (() => {
   "use strict";
+
+  // Supabase project settings: replace both values with your project's URL and anon key.
+  const SUPABASE_URL = "https://YOUR_PROJECT.supabase.co";
+  const SUPABASE_ANON_KEY = "YOUR_SUPABASE_ANON_KEY";
 
   // Difficulty settings (distances in canvas pixels; physics uses seconds).
   const SETTINGS = {
@@ -48,32 +52,121 @@
   const canvas = document.querySelector("#game");
   const ctx = canvas.getContext("2d");
   const nameInput = document.querySelector("#player-name");
-  const dobInput = document.querySelector("#player-dob");
   const readStore = (key, fallback) => { try { const value = localStorage.getItem(key); return value === null ? fallback : value; } catch (_) { return fallback; } };
   const writeStore = (key, value) => { try { localStorage.setItem(key, value); return true; } catch (_) { return false; } };
+  const SUPABASE_CONFIGURED = !SUPABASE_URL.includes("YOUR_PROJECT") && !SUPABASE_ANON_KEY.includes("YOUR_SUPABASE");
+  let supabaseClient = SUPABASE_CONFIGURED && window.supabase?.createClient ? window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY) : null;
+  let playerId = readStore("skybound-player-id", "");
+  function makeUuid() {
+    if (crypto.randomUUID) return crypto.randomUUID();
+    const bytes = crypto.getRandomValues(new Uint8Array(16));
+    bytes[6] = (bytes[6] & 0x0f) | 0x40; bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    return [...bytes].map((b, i) => `${[4, 6, 8, 10].includes(i) ? "-" : ""}${b.toString(16).padStart(2, "0")}`).join("");
+  }
+  if (!playerId) { playerId = makeUuid(); writeStore("skybound-player-id", playerId); }
   const rand = (a, b) => a + Math.random() * (b - a);
   let mode = "ready"; // ready | playing | paused | over
   let score = 0, best = Number(readStore("skybound-best", "0")) || 0;
   let playerName = readStore("skybound-name", "");
-  let leaderboard;
-  try { leaderboard = JSON.parse(readStore("skybound-leaderboard", "[]")); } catch (_) { leaderboard = []; }
-  if (!Array.isArray(leaderboard)) leaderboard = [];
-  // Collapse any older duplicate rows so each name has one persistent best score.
-  const uniqueScores = new Map();
-  for (const entry of leaderboard) {
-    if (!entry || typeof entry.name !== "string" || !Number.isFinite(Number(entry.score))) continue;
-    const name = entry.name.trim().slice(0, 18), key = name.toLocaleLowerCase();
-    if (name && (!uniqueScores.has(key) || Number(entry.score) > uniqueScores.get(key).score)) uniqueScores.set(key, { name, score: Number(entry.score) });
-  }
-  leaderboard = [...uniqueScores.values()].sort((a, b) => b.score - a.score);
-  writeStore("skybound-leaderboard", JSON.stringify(leaderboard));
-  let showLeaderboard = false, nameRequired = false, leaderboardPage = 0;
+  let showLeaderboard = false, leaderboardTab = "all", leaderboardRows = [], leaderboardOwn = null, leaderboardOwnRank = null;
+  let leaderboardLoading = false, leaderboardError = "", leaderboardToken = 0, newBestThisRun = false;
+  let showNameError = false, nameEditMode = false, scorePop = 0;
+  let profileNeedsSync = false;
   nameInput.value = playerName;
   let bird = { x: 132, y: 310, vy: 0, rotation: 0, wing: 0 };
   let pipes = [], elapsed = 0, groundOffset = 0;
   let muted = false, audio = null, lastTime = 0;
   const clouds = Array.from({length: 8}, (_, i) => ({ x: i * 95 + rand(0, 60), y: rand(70, 440), s: rand(.65, 1.25), speed: rand(10, 22) }));
   const buttons = {};
+
+  // Storage and player identity.
+  const USERNAME_RULE = /^[A-Za-z0-9_]{3,12}$/;
+  const BLOCKED_NAMES = ["admin", "fuck", "shit", "bitch", "asshole"];
+  function validateUsername(value) {
+    const name = value.trim();
+    if (!USERNAME_RULE.test(name)) return "Use 3-12 letters, numbers, or underscores.";
+    if (BLOCKED_NAMES.some(word => name.toLowerCase().includes(word))) return "Please choose a different username.";
+    return "";
+  }
+  function medalFor(points) {
+    if (points >= 100) return "💎 Platinum";
+    if (points >= 50) return "🥇 Gold";
+    if (points >= 25) return "🥈 Silver";
+    if (points >= 10) return "🥉 Bronze";
+    return "No medal yet";
+  }
+
+  // Leaderboard API (Supabase).
+  let authPromise = Promise.resolve(false);
+  if (supabaseClient) {
+    authPromise = supabaseClient.auth.getSession().then(async ({ data }) => {
+      let user = data.session?.user;
+      if (!user) {
+        const { data: signed, error } = await supabaseClient.auth.signInAnonymously();
+        if (error) throw error;
+        user = signed.user;
+      }
+      if (user?.id) { playerId = user.id; writeStore("skybound-player-id", playerId); return true; }
+      return false;
+    }).catch(error => { console.warn("Leaderboard sign-in unavailable:", error.message); return false; });
+  }
+  function periodStart() {
+    const now = new Date();
+    if (leaderboardTab === "today") { now.setHours(0, 0, 0, 0); return now.toISOString(); }
+    if (leaderboardTab === "week") {
+      const day = (now.getDay() + 6) % 7; now.setDate(now.getDate() - day); now.setHours(0, 0, 0, 0); return now.toISOString();
+    }
+    return null;
+  }
+  async function fetchLeaderboard() {
+    if (!supabaseClient) { leaderboardError = "Add your Supabase URL and anon key to enable the global leaderboard."; draw(); return; }
+    const requestId = ++leaderboardToken;
+    leaderboardLoading = true; leaderboardError = ""; draw();
+    try {
+      const signedIn = await authPromise;
+      if (!signedIn) throw new Error("Could not connect to the leaderboard. Check your connection and try again.");
+      const since = periodStart();
+      let topQuery = supabaseClient.from("scores").select("player_id,username,best_score,updated_at").order("best_score", { ascending: false }).order("player_id", { ascending: true }).limit(10);
+      let ownQuery = supabaseClient.from("scores").select("player_id,username,best_score,updated_at").eq("player_id", playerId).maybeSingle();
+      if (since) { topQuery = topQuery.gte("updated_at", since); ownQuery = ownQuery.gte("updated_at", since); }
+      const [{ data: top, error: topError }, { data: own, error: ownError }] = await Promise.all([topQuery, ownQuery]);
+      if (topError) throw topError; if (ownError) throw ownError;
+      leaderboardRows = top || []; leaderboardOwn = own || null; leaderboardOwnRank = null;
+      if (own) {
+        let above = supabaseClient.from("scores").select("player_id", { count: "exact", head: true }).gt("best_score", own.best_score);
+        let tiedAhead = supabaseClient.from("scores").select("player_id", { count: "exact", head: true }).eq("best_score", own.best_score).lt("player_id", playerId);
+        if (since) { above = above.gte("updated_at", since); tiedAhead = tiedAhead.gte("updated_at", since); }
+        const [a, t] = await Promise.all([above, tiedAhead]);
+        if (a.error) throw a.error; if (t.error) throw t.error;
+        leaderboardOwnRank = (a.count || 0) + (t.count || 0) + 1;
+      }
+    } catch (error) {
+      if (requestId === leaderboardToken) leaderboardError = error.message || "The leaderboard could not be loaded. Please try again.";
+    } finally {
+      if (requestId === leaderboardToken) { leaderboardLoading = false; draw(); }
+    }
+  }
+  async function submitScore(value = score, forceProfile = false) {
+    if (!supabaseClient) { submitMessage = "Configure Supabase to submit scores."; draw(); return; }
+    if (submitPending) return;
+    submitPending = true; submitMessage = "Submitting…"; draw();
+    try {
+      if (!await authPromise) throw new Error("Sign-in failed. Try again when you are online.");
+      const { data: existing, error: readError } = await supabaseClient.from("scores").select("best_score").eq("player_id", playerId).maybeSingle();
+      if (readError) throw readError;
+      const prior = existing?.best_score || 0;
+      const candidate = Math.min(999, Math.max(0, value));
+      if (candidate <= prior && !forceProfile) { submitMessage = "Your global best is already higher."; return; }
+      const nextBest = Math.max(candidate, prior);
+      const { error } = await supabaseClient.from("scores").upsert({ player_id: playerId, username: playerName, best_score: nextBest, updated_at: new Date().toISOString() }, { onConflict: "player_id" });
+      if (error) throw error;
+      profileNeedsSync = false;
+      submitMessage = "Score submitted!";
+      if (showLeaderboard) fetchLeaderboard();
+    } catch (error) { submitMessage = `Offline or unavailable: ${error.message}`; }
+    finally { submitPending = false; draw(); }
+  }
+  let submitMessage = "", submitPending = false;
 
   function sound(kind) {
     if (muted) return;
@@ -94,11 +187,16 @@
     } catch (_) { /* Audio is an optional enhancement. */ }
   }
   function startGame() {
-    playerName = nameInput.value.trim().slice(0, 18);
-    if (!playerName) { nameRequired = true; nameInput.focus(); return; }
-    if (!dobInput.value || new Date(`${dobInput.value}T00:00:00`) > new Date()) { nameRequired = true; dobInput.focus(); return; }
-    nameRequired = false; writeStore("skybound-name", playerName);
+    const candidate = nameInput.value.trim();
+    const validation = validateUsername(candidate);
+    if (!playerName || nameEditMode || candidate !== playerName) {
+      if (validation) { showNameError = true; nameInput.focus(); return; }
+      if (candidate !== playerName) profileNeedsSync = true;
+      playerName = candidate; writeStore("skybound-name", playerName); showNameError = false; nameEditMode = false;
+    }
+    if (!playerName) { nameInput.focus(); return; }
     score = 0; elapsed = 0; pipes = [];
+    newBestThisRun = false; submitMessage = "";
     bird = { x: 132, y: 310, vy: 0, rotation: 0, wing: 0 };
     pipes.push(makePipe(W + 30));
     mode = "playing"; flap();
@@ -112,14 +210,9 @@
   function gameOver() {
     if (mode !== "playing") return;
     mode = "over"; sound("hit");
-    if (score > best) { best = score; writeStore("skybound-best", String(best)); }
-    // A name has one row. Store that player's best run and keep the list ranked.
-    const identity = playerName.trim().toLocaleLowerCase();
-    const existing = leaderboard.find(entry => entry.name.toLocaleLowerCase() === identity);
-    if (existing) existing.score = Math.max(existing.score, score);
-    else leaderboard.push({ name: playerName, score });
-    leaderboard.sort((a, b) => b.score - a.score);
-    writeStore("skybound-leaderboard", JSON.stringify(leaderboard));
+    newBestThisRun = score > best;
+    if (newBestThisRun) { best = score; writeStore("skybound-best", String(best)); }
+    submitScore(score, profileNeedsSync);
   }
   function act() {
     if (mode === "ready" || mode === "over") { if (showLeaderboard) return; startGame(); return; }
@@ -138,13 +231,14 @@
     for (const cloud of clouds) { cloud.x -= cloud.speed * dt; if (cloud.x < -110) { cloud.x = W + rand(10, 90); cloud.y = rand(60, 440); } }
     for (const p of pipes) {
       p.x -= speed * dt;
-      if (!p.scored && p.x + 72 < bird.x) { p.scored = true; score++; sound("score"); }
+      if (!p.scored && p.x + 72 < bird.x) { p.scored = true; score++; scorePop = 1; sound("score"); }
       const withinX = bird.x + SETTINGS.birdRadius > p.x && bird.x - SETTINGS.birdRadius < p.x + 72;
       if (withinX && (bird.y - SETTINGS.birdRadius < p.gapY - SETTINGS.pipeGap / 2 || bird.y + SETTINGS.birdRadius > p.gapY + SETTINGS.pipeGap / 2)) gameOver();
     }
     pipes = pipes.filter(p => p.x > -90);
     if (!pipes.length || pipes[pipes.length - 1].x < W - SETTINGS.pipeSpacing) pipes.push(makePipe(W + 20));
     if (bird.y - SETTINGS.birdRadius <= 0 || bird.y + SETTINGS.birdRadius >= GROUND_Y) gameOver();
+    scorePop = Math.max(0, scorePop - dt * 3.4);
   }
   function rounded(x, y, w, h, r, fill) { ctx.fillStyle = fill; ctx.beginPath(); ctx.roundRect(x, y, w, h, r); ctx.fill(); }
   function text(str, x, y, size, color, weight = 900) {
@@ -194,87 +288,152 @@
     rounded(x, y, w, h, 18, fill); ctx.strokeStyle = "#174b5d22"; ctx.lineWidth = 2; ctx.stroke();
     text(label, x + w / 2, y + h / 2 + 1, 18, "#174b5d", 900);
   }
+  // UI drawing: canvas game scene, scoreboard, game-over card, and responsive overlay.
   function draw() {
-    buttons.pause = buttons.mute = buttons.restart = null;
-    buttons.leaderboard = buttons.back = buttons.previous = buttons.next = null;
-    nameInput.style.display = mode === "ready" && !showLeaderboard ? "block" : "none";
-    dobInput.style.display = mode === "ready" && !showLeaderboard ? "block" : "none";
-    const sky = ctx.createLinearGradient(0, 0, 0, H); sky.addColorStop(0, "#62cce8"); sky.addColorStop(.65, "#a6e9ed"); sky.addColorStop(1, "#d4f3d5");
+    for (const key of Object.keys(buttons)) buttons[key] = null;
+    nameInput.style.display = mode === "ready" && !showLeaderboard && (!playerName || nameEditMode) ? "block" : "none";
+    nameInput.classList.toggle("editing", !!playerName && nameEditMode);
+    const sky = ctx.createLinearGradient(0, 0, 0, H);
+    sky.addColorStop(0, "#62cce8"); sky.addColorStop(.65, "#a6e9ed"); sky.addColorStop(1, "#d4f3d5");
     ctx.fillStyle = sky; ctx.fillRect(0, 0, W, H);
-    // distant soft sun and cloud layers
     ctx.fillStyle = "#fff7b933"; ctx.beginPath(); ctx.arc(385, 116, 57, 0, Math.PI * 2); ctx.fill();
     for (const c of clouds) drawCloud(c.x, c.y, c.s);
     ctx.fillStyle = "#83d8c2"; ctx.beginPath(); ctx.moveTo(0, 500); ctx.quadraticCurveTo(115, 455, 215, 505); ctx.quadraticCurveTo(330, 445, 480, 500); ctx.lineTo(480, GROUND_Y); ctx.lineTo(0, GROUND_Y); ctx.fill();
     for (const p of pipes) drawPipe(p);
     drawBird(); drawGround();
-    if (mode === "playing" || mode === "paused") text(String(score), W / 2, 84, 54, "#ffffff");
     if (mode === "playing" || mode === "paused") {
-      button("pause", mode === "paused" ? "▶  RESUME" : "Ⅱ  PAUSE", 22, 22, 118, 44);
-      button("mute", muted ? "♪  OFF" : "♪  ON", W - 112, 22, 90, 44);
+      ctx.save(); ctx.translate(W / 2, 84);
+      const pop = 1 + scorePop * .34; ctx.scale(pop, pop);
+      text(String(score), 0, 0, 54, "#ffffff"); ctx.restore();
+      rounded(W - 131, 79, 105, 38, 16, "#ffffffcf");
+      text("BEST " + best, W - 78, 98, 16, "#397a80", 900);
+      button("pause", mode === "paused" ? "RESUME" : "PAUSE", 22, 22, 118, 44);
+      button("mute", muted ? "SOUND OFF" : "SOUND ON", W - 112, 22, 90, 44);
     }
     if (mode === "ready") {
-      button("leaderboard", "🏆 SCORES", W - 148, 22, 126, 44, "#ffffff");
+      button("settings", "SETTINGS", 22, 22, 106, 44);
+      button("leaderboard", "SCORES", W - 122, 22, 100, 44);
       rounded(36, 174, W - 72, 315, 30, "#ffffffdf");
       text("SKYBOUND", W / 2, 230, 45, "#1487a0");
       text("A LITTLE FLIGHT OF FANCY", W / 2, 270, 13, "#5f929d", 800);
-      drawBird();
-      text(nameRequired ? "ENTER NAME AND VALID BIRTH DATE" : "TAP / PRESS SPACE TO START", W / 2, 414, nameRequired ? 14 : 16, nameRequired ? "#d66c55" : "#174b5d");
-      text("Your birth date is private and never saved", W / 2, 438, 11, "#6c969a", 800);
-      rounded(145, 455, 190, 26, 13, "#fff2c8"); text(`BEST  ${best}`, W / 2, 468, 15, "#946b2d", 900);
-      if (showLeaderboard) {
-        rounded(44, 128, W - 88, 484, 28, "#fffffff2");
-        text("LEADERBOARD", W / 2, 174, 30, "#1487a0");
-        text("RANK", 105, 219, 13, "#76a3a8", 900); text("PLAYER", 230, 219, 13, "#76a3a8", 900); text("SCORE", 355, 219, 13, "#76a3a8", 900);
-        const pageSize = 10, pageCount = Math.max(1, Math.ceil(leaderboard.length / pageSize));
-        leaderboardPage = Math.min(leaderboardPage, pageCount - 1);
-        const rows = leaderboard.slice(leaderboardPage * pageSize, (leaderboardPage + 1) * pageSize);
-        if (!rows.length) text("No scores yet — take the first flight!", W / 2, 280, 15, "#648b91", 800);
-        rows.forEach((row, i) => {
-          const y = 250 + i * 28;
-          if (i % 2 === 0) rounded(72, y - 12, W - 144, 25, 8, "#edf8f7");
-          text(String(i + 1), 105, y, 14, "#54868e", 800);
-          text(row.name.length > 13 ? row.name.slice(0, 12) + "…" : row.name, 230, y, 14, "#174b5d", 800);
-          text(String(row.score), 355, y, 15, "#1487a0");
-        });
-        text(`PAGE ${leaderboardPage + 1} / ${pageCount}`, W / 2, 532, 13, "#648b91", 800);
-        if (leaderboardPage > 0) button("previous", "‹ PREV", 77, 512, 112, 40, "#edf8f7");
-        if (leaderboardPage < pageCount - 1) button("next", "NEXT ›", 291, 512, 112, 40, "#edf8f7");
-        button("back", "BACK", 170, 559, 140, 40, "#ffcf4b");
+      if (!playerName || nameEditMode) {
+        text(nameEditMode ? "CHANGE USERNAME" : "CHOOSE YOUR PLAYER NAME", W / 2, 290, 16, "#174b5d");
+        if (showNameError) text(validateUsername(nameInput.value), W / 2, 320, 12, "#d66c55", 800);
+        button("saveName", "SAVE NAME", 165, 432, 150, 42, "#ffcf4b");
+        if (playerName) button("cancelName", "CANCEL", 165, 480, 150, 38, "#edf8f7");
+      } else {
+        text("WELCOME, " + playerName.toUpperCase(), W / 2, 330, 19, "#1487a0");
+        text("TAP / PRESS SPACE TO START", W / 2, 407, 17, "#174b5d");
       }
+      rounded(145, 455, 190, 26, 13, "#fff2c8");
+      text("BEST " + best, W / 2, 468, 15, "#946b2d", 900);
     }
     if (mode === "paused") {
-      rounded(86, 271, W - 172, 142, 26, "#ffffffed"); text("PAUSED", W / 2, 313, 34, "#1487a0"); text("Press P or tap to continue", W / 2, 359, 16, "#527d86", 800);
+      rounded(86, 271, W - 172, 142, 26, "#ffffffed");
+      text("PAUSED", W / 2, 313, 34, "#1487a0");
+      text("Press P or tap to continue", W / 2, 359, 16, "#527d86", 800);
     }
     if (mode === "over") {
-      rounded(54, 187, W - 108, 326, 30, "#ffffffed");
-      text("FLIGHT COMPLETE", W / 2, 237, 25, "#e58242");
-      text(String(score), W / 2, 303, 60, "#1487a0"); text("SCORE", W / 2, 345, 14, "#76a3a8", 900);
-      rounded(116, 370, 248, 42, 16, "#edf8f7"); text(`BEST  ${best}`, W / 2, 391, 19, "#397a80");
-      button("restart", "PLAY AGAIN", 135, 439, 210, 54, "#ffcf4b");
+      rounded(42, 147, W - 84, 438, 30, "#ffffffed");
+      text("FLIGHT COMPLETE", W / 2, 192, 25, "#e58242");
+      text(String(score), W / 2, 255, 60, "#1487a0");
+      text("SCORE", W / 2, 294, 14, "#76a3a8", 900);
+      rounded(116, 316, 248, 42, 16, "#edf8f7");
+      text("BEST " + best, W / 2, 337, 19, "#397a80");
+      text(medalFor(score), W / 2, 385, 22, "#946b2d");
+      if (newBestThisRun) {
+        ctx.save(); ctx.globalAlpha = .65 + .35 * Math.sin(performance.now() / 130);
+        rounded(140, 407, 200, 30, 15, "#fff2b3"); ctx.restore();
+        text("NEW BEST!", W / 2, 422, 19, "#d87531");
+      }
+      button("restart", "RESTART", 60, 460, 164, 48, "#ffcf4b");
+      button("submit", submitPending ? "SENDING..." : "SUBMIT SCORE", 244, 460, 176, 48, "#dff3ef");
+      button("leaderboard", "VIEW LEADERBOARD", 110, 520, 260, 46, "#ffffff");
+      if (submitMessage) text(submitMessage.slice(0, 48), W / 2, 576, 11, "#527d86", 800);
+    }
+    if (showLeaderboard) drawLeaderboardOverlay();
+  }
+
+  function drawLeaderboardOverlay() {
+    rounded(22, 62, W - 44, 590, 28, "#fffffff2");
+    text("GLOBAL LEADERBOARD", W / 2, 105, 25, "#1487a0");
+    button("closeLeaderboard", "CLOSE", 340, 78, 96, 38, "#edf8f7");
+    button("tabAll", "ALL TIME", 48, 143, 112, 38, leaderboardTab === "all" ? "#ffcf4b" : "#edf8f7");
+    button("tabWeek", "THIS WEEK", 173, 143, 112, 38, leaderboardTab === "week" ? "#ffcf4b" : "#edf8f7");
+    button("tabToday", "TODAY", 298, 143, 90, 38, leaderboardTab === "today" ? "#ffcf4b" : "#edf8f7");
+    button("refresh", "↻", 394, 143, 62, 38, "#dff3ef");
+    text("RANK", 77, 205, 12, "#76a3a8", 900);
+    text("USERNAME", 229, 205, 12, "#76a3a8", 900);
+    text("SCORE", 384, 205, 12, "#76a3a8", 900);
+    if (leaderboardLoading) {
+      ctx.save(); ctx.translate(W / 2, 354); ctx.rotate(performance.now() / 250);
+      ctx.strokeStyle = "#31aabd"; ctx.lineWidth = 5; ctx.beginPath(); ctx.arc(0, 0, 19, .3, Math.PI * 1.7); ctx.stroke(); ctx.restore();
+      text("Loading scores...", W / 2, 393, 14, "#648b91", 800);
+    } else if (leaderboardError) {
+      text("Leaderboard unavailable", W / 2, 300, 17, "#d66c55");
+      text(leaderboardError.slice(0, 55), W / 2, 329, 11, "#648b91", 800);
+      button("retry", "TRY AGAIN", 165, 360, 150, 42, "#ffcf4b");
+    } else if (!leaderboardRows.length) {
+      text("No scores yet, be the first!", W / 2, 320, 17, "#648b91", 800);
+    } else {
+      leaderboardRows.forEach((row, i) => {
+        const y = 239 + i * 29, mine = row.player_id === playerId;
+        if (mine) rounded(45, y - 13, W - 90, 27, 9, "#fff0bb");
+        else if (i % 2 === 0) rounded(45, y - 13, W - 90, 27, 9, "#edf8f7");
+        const rank = i === 0 ? "🥇" : i === 1 ? "🥈" : i === 2 ? "🥉" : String(i + 1);
+        text(rank, 77, y, 14, i < 3 ? "#c08b2d" : "#54868e", 900);
+        text(row.username.length > 14 ? row.username.slice(0, 13) + "..." : row.username, 229, y, 14, mine ? "#b66d24" : "#174b5d", 800);
+        text(String(row.best_score), 384, y, 15, "#1487a0");
+      });
+      if (leaderboardOwn && leaderboardOwnRank > 10) {
+        rounded(45, 552, W - 90, 32, 10, "#fff0bb");
+        text("You: #" + leaderboardOwnRank + " - " + leaderboardOwn.best_score + " pts", W / 2, 568, 14, "#9b6728", 900);
+      }
     }
   }
   function point(e) { const r = canvas.getBoundingClientRect(); return { x: (e.clientX - r.left) * W / r.width, y: (e.clientY - r.top) * H / r.height }; }
   function hitButton(p, id) { const b = buttons[id]; return b && p.x >= b.x && p.x <= b.x + b.w && p.y >= b.y && p.y <= b.y + b.h; }
+  // Game integration: inputs keep the existing flap, pause, and restart behavior.
   canvas.addEventListener("pointerdown", e => {
     e.preventDefault(); const p = point(e);
     if (hitButton(p, "mute")) { muted = !muted; draw(); return; }
     if (hitButton(p, "pause")) { togglePause(); draw(); return; }
     if (hitButton(p, "restart")) { startGame(); draw(); return; }
-    if (hitButton(p, "leaderboard")) { leaderboardPage = 0; showLeaderboard = true; draw(); return; }
-    if (hitButton(p, "back")) { showLeaderboard = false; draw(); return; }
-    if (hitButton(p, "previous")) { leaderboardPage--; draw(); return; }
-    if (hitButton(p, "next")) { leaderboardPage++; draw(); return; }
+    if (hitButton(p, "submit")) { submitScore(score); return; }
+    if (hitButton(p, "leaderboard")) { showLeaderboard = true; fetchLeaderboard(); draw(); return; }
+    if (hitButton(p, "closeLeaderboard")) { showLeaderboard = false; draw(); return; }
+    if (hitButton(p, "tabAll")) { leaderboardTab = "all"; fetchLeaderboard(); return; }
+    if (hitButton(p, "tabWeek")) { leaderboardTab = "week"; fetchLeaderboard(); return; }
+    if (hitButton(p, "tabToday")) { leaderboardTab = "today"; fetchLeaderboard(); return; }
+    if (hitButton(p, "refresh") || hitButton(p, "retry")) { fetchLeaderboard(); return; }
+    if (hitButton(p, "settings")) { nameEditMode = true; nameInput.value = playerName; draw(); nameInput.focus(); return; }
+    if (hitButton(p, "saveName")) {
+      const error = validateUsername(nameInput.value);
+      if (error) { showNameError = true; draw(); nameInput.focus(); return; }
+      playerName = nameInput.value.trim(); writeStore("skybound-name", playerName); profileNeedsSync = true;
+      showNameError = false; nameEditMode = false; draw();
+      if (supabaseClient && leaderboardOwn) submitScore(best, true);
+      return;
+    }
+    if (hitButton(p, "cancelName")) { nameEditMode = false; showNameError = false; nameInput.value = playerName; draw(); return; }
     act(); draw();
   });
   window.addEventListener("keydown", e => {
     if (e.code === "Enter" && mode === "ready" && showLeaderboard) { showLeaderboard = false; draw(); return; }
-    if (e.code === "Enter" && mode === "ready" && !showLeaderboard) { e.preventDefault(); startGame(); draw(); return; }
+    if (e.code === "Enter" && mode === "ready" && (!playerName || nameEditMode)) {
+      e.preventDefault();
+      if (nameEditMode && playerName) {
+        const error = validateUsername(nameInput.value);
+        if (error) { showNameError = true; draw(); return; }
+        playerName = nameInput.value.trim(); writeStore("skybound-name", playerName); profileNeedsSync = true; nameEditMode = false; showNameError = false; draw();
+      } else { startGame(); draw(); }
+      return;
+    }
     if (e.code === "Space" || e.code === "ArrowUp") { e.preventDefault(); if (!e.repeat) act(); }
     else if (e.key.toLowerCase() === "p" && (mode === "playing" || mode === "paused")) togglePause();
     else if (e.key.toLowerCase() === "m") muted = !muted;
   });
-  nameInput.addEventListener("input", () => { nameRequired = false; });
-  dobInput.addEventListener("change", () => { nameRequired = false; });
+  nameInput.addEventListener("input", () => { showNameError = false; });
   function frame(now) {
     const dt = lastTime ? Math.min((now - lastTime) / 1000, .035) : 0;
     lastTime = now; update(dt); draw(); requestAnimationFrame(frame);
