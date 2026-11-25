@@ -69,7 +69,7 @@
   let score = 0, best = Number(readStore("skybound-best", "0")) || 0;
   let playerName = readStore("skybound-name", "");
   let showLeaderboard = false, leaderboardTab = "all", leaderboardRows = [], leaderboardOwn = null, leaderboardOwnRank = null;
-  let leaderboardLoading = false, leaderboardError = "", leaderboardToken = 0, newBestThisRun = false;
+  let leaderboardLoading = false, leaderboardError = "", leaderboardNotice = "", leaderboardToken = 0, newBestThisRun = false;
   let showNameError = false, nameEditMode = false, scorePop = 0;
   let profileNeedsSync = false;
   nameInput.value = playerName;
@@ -118,10 +118,43 @@
     }
     return null;
   }
+  function readLocalScores() {
+    try {
+      const items = JSON.parse(readStore("skybound-leaderboard", "[]"));
+      return Array.isArray(items) ? items.filter(item => item && item.player_id && Number.isFinite(Number(item.best_score))) : [];
+    } catch (_) { return []; }
+  }
+  function saveLocalScore() {
+    const rows = readLocalScores();
+    const existing = rows.find(row => row.player_id === playerId);
+    if (existing) {
+      const achievedNewBest = score > Number(existing.best_score);
+      const changedUsername = existing.username !== playerName;
+      existing.username = playerName;
+      existing.best_score = Math.max(Number(existing.best_score) || 0, score);
+      if (achievedNewBest || changedUsername) existing.updated_at = new Date().toISOString();
+    } else rows.push({ player_id: playerId, username: playerName, best_score: score, updated_at: new Date().toISOString() });
+    rows.sort((a, b) => b.best_score - a.best_score);
+    writeStore("skybound-leaderboard", JSON.stringify(rows));
+  }
+  function showLocalScores(notice) {
+    const since = periodStart();
+    const rows = readLocalScores().filter(row => !since || new Date(row.updated_at) >= new Date(since));
+    rows.sort((a, b) => b.best_score - a.best_score || a.player_id.localeCompare(b.player_id));
+    leaderboardRows = rows.slice(0, 10);
+    leaderboardOwn = rows.find(row => row.player_id === playerId) || null;
+    const ownIndex = rows.findIndex(row => row.player_id === playerId);
+    leaderboardOwnRank = ownIndex < 0 ? null : ownIndex + 1;
+    leaderboardNotice = notice;
+  }
   async function fetchLeaderboard() {
-    if (!supabaseClient) { leaderboardError = "Add your Supabase URL and anon key to enable the global leaderboard."; draw(); return; }
+    if (!supabaseClient) {
+      leaderboardError = "";
+      showLocalScores("Showing scores saved in this browser. Configure Supabase for global scores.");
+      draw(); return;
+    }
     const requestId = ++leaderboardToken;
-    leaderboardLoading = true; leaderboardError = ""; draw();
+    leaderboardLoading = true; leaderboardError = ""; leaderboardNotice = ""; draw();
     try {
       const signedIn = await authPromise;
       if (!signedIn) throw new Error("Could not connect to the leaderboard. Check your connection and try again.");
@@ -212,6 +245,7 @@
     mode = "over"; sound("hit");
     newBestThisRun = score > best;
     if (newBestThisRun) { best = score; writeStore("skybound-best", String(best)); }
+    saveLocalScore();
     submitScore(score, profileNeedsSync);
   }
   function act() {
@@ -390,6 +424,7 @@
         text("You: #" + leaderboardOwnRank + " - " + leaderboardOwn.best_score + " pts", W / 2, 568, 14, "#9b6728", 900);
       }
     }
+    if (leaderboardNotice) text(leaderboardNotice.slice(0, 58), W / 2, 625, 10, "#648b91", 800);
   }
   function point(e) { const r = canvas.getBoundingClientRect(); return { x: (e.clientX - r.left) * W / r.width, y: (e.clientY - r.top) * H / r.height }; }
   function hitButton(p, id) { const b = buttons[id]; return b && p.x >= b.x && p.x <= b.x + b.w && p.y >= b.y && p.y <= b.y + b.h; }
