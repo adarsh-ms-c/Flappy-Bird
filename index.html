@@ -15,16 +15,19 @@
     body { display: grid; place-items: center; background: radial-gradient(ellipse at 50% 35%, #f7fdff 0%, #e5f7fc 56%, #cdebf4 100%); }
     main { position: relative; width: min(100vw, 66.6667vh); height: min(100vh, 150vw); height: min(100dvh, 150vw); display: grid; place-items: center; padding: 12px; }
     canvas { display: block; width: 100%; height: 100%; max-width: 480px; max-height: 720px; border-radius: 24px; box-shadow: 0 24px 70px #25667b30, 0 3px 12px #25667b1c; touch-action: none; }
-    #player-name { position: absolute; z-index: 2; top: 44.5%; left: 25%; width: 50%; height: 6%; min-height: 38px; border: 2px solid #c6e5e7; border-radius: 14px; padding: 0 12px; background: #fff; color: #174b5d; font: 800 clamp(14px, 3.4vw, 17px) "Nunito", system-ui, sans-serif; text-align: center; outline: none; }
-    #player-name:focus { border-color: #46b8c8; box-shadow: 0 0 0 4px #46b8c833; }
-    #player-name::placeholder { color: #88aeb2; }
+    .player-field { position: absolute; z-index: 2; left: 25%; width: 50%; height: 5.8%; min-height: 37px; border: 2px solid #c6e5e7; border-radius: 14px; padding: 0 12px; background: #fff; color: #174b5d; font: 800 clamp(13px, 3.3vw, 16px) "Nunito", system-ui, sans-serif; text-align: center; outline: none; }
+    #player-name { top: 42%; }
+    #player-dob { top: 48.8%; }
+    .player-field:focus { border-color: #46b8c8; box-shadow: 0 0 0 4px #46b8c833; }
+    .player-field::placeholder { color: #88aeb2; }
     @media (max-aspect-ratio: 2/3) { main { width: 100vw; height: 150vw; max-height: 100dvh; } canvas { border-radius: 0; } }
   </style>
 </head>
 <body>
 <main aria-label="Skybound canvas game">
   <canvas id="game" width="480" height="720" aria-label="Flappy Bird-style game. Tap, click, or press Space to flap."></canvas>
-  <input id="player-name" maxlength="18" autocomplete="nickname" placeholder="Enter your name" aria-label="Enter your name before playing">
+  <input class="player-field" id="player-name" maxlength="18" autocomplete="nickname" placeholder="Enter a unique name" aria-label="Enter your name before playing">
+  <input class="player-field" id="player-dob" type="date" autocomplete="off" aria-label="Date of birth (kept private)" title="Date of birth is not saved or shown on the leaderboard">
 </main>
 <script>
 (() => {
@@ -45,12 +48,26 @@
   const canvas = document.querySelector("#game");
   const ctx = canvas.getContext("2d");
   const nameInput = document.querySelector("#player-name");
+  const dobInput = document.querySelector("#player-dob");
+  const readStore = (key, fallback) => { try { const value = localStorage.getItem(key); return value === null ? fallback : value; } catch (_) { return fallback; } };
+  const writeStore = (key, value) => { try { localStorage.setItem(key, value); return true; } catch (_) { return false; } };
   const rand = (a, b) => a + Math.random() * (b - a);
   let mode = "ready"; // ready | playing | paused | over
-  let score = 0, best = Number(localStorage.getItem("skybound-best") || 0);
-  let playerName = localStorage.getItem("skybound-name") || "";
-  let leaderboard = JSON.parse(localStorage.getItem("skybound-leaderboard") || "[]");
-  let showLeaderboard = false, nameRequired = false;
+  let score = 0, best = Number(readStore("skybound-best", "0")) || 0;
+  let playerName = readStore("skybound-name", "");
+  let leaderboard;
+  try { leaderboard = JSON.parse(readStore("skybound-leaderboard", "[]")); } catch (_) { leaderboard = []; }
+  if (!Array.isArray(leaderboard)) leaderboard = [];
+  // Collapse any older duplicate rows so each name has one persistent best score.
+  const uniqueScores = new Map();
+  for (const entry of leaderboard) {
+    if (!entry || typeof entry.name !== "string" || !Number.isFinite(Number(entry.score))) continue;
+    const name = entry.name.trim().slice(0, 18), key = name.toLocaleLowerCase();
+    if (name && (!uniqueScores.has(key) || Number(entry.score) > uniqueScores.get(key).score)) uniqueScores.set(key, { name, score: Number(entry.score) });
+  }
+  leaderboard = [...uniqueScores.values()].sort((a, b) => b.score - a.score);
+  writeStore("skybound-leaderboard", JSON.stringify(leaderboard));
+  let showLeaderboard = false, nameRequired = false, leaderboardPage = 0;
   nameInput.value = playerName;
   let bird = { x: 132, y: 310, vy: 0, rotation: 0, wing: 0 };
   let pipes = [], elapsed = 0, groundOffset = 0;
@@ -79,7 +96,8 @@
   function startGame() {
     playerName = nameInput.value.trim().slice(0, 18);
     if (!playerName) { nameRequired = true; nameInput.focus(); return; }
-    nameRequired = false; localStorage.setItem("skybound-name", playerName);
+    if (!dobInput.value || new Date(`${dobInput.value}T00:00:00`) > new Date()) { nameRequired = true; dobInput.focus(); return; }
+    nameRequired = false; writeStore("skybound-name", playerName);
     score = 0; elapsed = 0; pipes = [];
     bird = { x: 132, y: 310, vy: 0, rotation: 0, wing: 0 };
     pipes.push(makePipe(W + 30));
@@ -94,11 +112,14 @@
   function gameOver() {
     if (mode !== "playing") return;
     mode = "over"; sound("hit");
-    if (score > best) { best = score; localStorage.setItem("skybound-best", String(best)); }
-    leaderboard.push({ name: playerName || "Player", score });
+    if (score > best) { best = score; writeStore("skybound-best", String(best)); }
+    // A name has one row. Store that player's best run and keep the list ranked.
+    const identity = playerName.trim().toLocaleLowerCase();
+    const existing = leaderboard.find(entry => entry.name.toLocaleLowerCase() === identity);
+    if (existing) existing.score = Math.max(existing.score, score);
+    else leaderboard.push({ name: playerName, score });
     leaderboard.sort((a, b) => b.score - a.score);
-    leaderboard = leaderboard.slice(0, 50);
-    localStorage.setItem("skybound-leaderboard", JSON.stringify(leaderboard));
+    writeStore("skybound-leaderboard", JSON.stringify(leaderboard));
   }
   function act() {
     if (mode === "ready" || mode === "over") { if (showLeaderboard) return; startGame(); return; }
@@ -175,8 +196,9 @@
   }
   function draw() {
     buttons.pause = buttons.mute = buttons.restart = null;
-    buttons.leaderboard = buttons.back = null;
+    buttons.leaderboard = buttons.back = buttons.previous = buttons.next = null;
     nameInput.style.display = mode === "ready" && !showLeaderboard ? "block" : "none";
+    dobInput.style.display = mode === "ready" && !showLeaderboard ? "block" : "none";
     const sky = ctx.createLinearGradient(0, 0, 0, H); sky.addColorStop(0, "#62cce8"); sky.addColorStop(.65, "#a6e9ed"); sky.addColorStop(1, "#d4f3d5");
     ctx.fillStyle = sky; ctx.fillRect(0, 0, W, H);
     // distant soft sun and cloud layers
@@ -196,13 +218,16 @@
       text("SKYBOUND", W / 2, 230, 45, "#1487a0");
       text("A LITTLE FLIGHT OF FANCY", W / 2, 270, 13, "#5f929d", 800);
       drawBird();
-      text(nameRequired ? "PLEASE ENTER YOUR NAME" : "TAP / PRESS SPACE TO START", W / 2, 390, nameRequired ? 16 : 17, nameRequired ? "#d66c55" : "#174b5d");
-      rounded(145, 425, 190, 30, 15, "#fff2c8"); text(`BEST  ${best}`, W / 2, 440, 16, "#946b2d", 900);
+      text(nameRequired ? "ENTER NAME AND VALID BIRTH DATE" : "TAP / PRESS SPACE TO START", W / 2, 414, nameRequired ? 14 : 16, nameRequired ? "#d66c55" : "#174b5d");
+      text("Your birth date is private and never saved", W / 2, 438, 11, "#6c969a", 800);
+      rounded(145, 455, 190, 26, 13, "#fff2c8"); text(`BEST  ${best}`, W / 2, 468, 15, "#946b2d", 900);
       if (showLeaderboard) {
-        rounded(44, 128, W - 88, 438, 28, "#fffffff2");
+        rounded(44, 128, W - 88, 484, 28, "#fffffff2");
         text("LEADERBOARD", W / 2, 174, 30, "#1487a0");
         text("RANK", 105, 219, 13, "#76a3a8", 900); text("PLAYER", 230, 219, 13, "#76a3a8", 900); text("SCORE", 355, 219, 13, "#76a3a8", 900);
-        const rows = leaderboard.slice(0, 10);
+        const pageSize = 10, pageCount = Math.max(1, Math.ceil(leaderboard.length / pageSize));
+        leaderboardPage = Math.min(leaderboardPage, pageCount - 1);
+        const rows = leaderboard.slice(leaderboardPage * pageSize, (leaderboardPage + 1) * pageSize);
         if (!rows.length) text("No scores yet — take the first flight!", W / 2, 280, 15, "#648b91", 800);
         rows.forEach((row, i) => {
           const y = 250 + i * 28;
@@ -211,7 +236,10 @@
           text(row.name.length > 13 ? row.name.slice(0, 12) + "…" : row.name, 230, y, 14, "#174b5d", 800);
           text(String(row.score), 355, y, 15, "#1487a0");
         });
-        button("back", "BACK", 170, 510, 140, 42, "#ffcf4b");
+        text(`PAGE ${leaderboardPage + 1} / ${pageCount}`, W / 2, 532, 13, "#648b91", 800);
+        if (leaderboardPage > 0) button("previous", "‹ PREV", 77, 512, 112, 40, "#edf8f7");
+        if (leaderboardPage < pageCount - 1) button("next", "NEXT ›", 291, 512, 112, 40, "#edf8f7");
+        button("back", "BACK", 170, 559, 140, 40, "#ffcf4b");
       }
     }
     if (mode === "paused") {
@@ -232,18 +260,21 @@
     if (hitButton(p, "mute")) { muted = !muted; draw(); return; }
     if (hitButton(p, "pause")) { togglePause(); draw(); return; }
     if (hitButton(p, "restart")) { startGame(); draw(); return; }
-    if (hitButton(p, "leaderboard")) { showLeaderboard = true; draw(); return; }
+    if (hitButton(p, "leaderboard")) { leaderboardPage = 0; showLeaderboard = true; draw(); return; }
     if (hitButton(p, "back")) { showLeaderboard = false; draw(); return; }
+    if (hitButton(p, "previous")) { leaderboardPage--; draw(); return; }
+    if (hitButton(p, "next")) { leaderboardPage++; draw(); return; }
     act(); draw();
   });
   window.addEventListener("keydown", e => {
     if (e.code === "Enter" && mode === "ready" && showLeaderboard) { showLeaderboard = false; draw(); return; }
-    if (e.code === "Enter" && mode === "ready" && document.activeElement === nameInput) { e.preventDefault(); startGame(); draw(); return; }
+    if (e.code === "Enter" && mode === "ready" && !showLeaderboard) { e.preventDefault(); startGame(); draw(); return; }
     if (e.code === "Space" || e.code === "ArrowUp") { e.preventDefault(); if (!e.repeat) act(); }
     else if (e.key.toLowerCase() === "p" && (mode === "playing" || mode === "paused")) togglePause();
     else if (e.key.toLowerCase() === "m") muted = !muted;
   });
   nameInput.addEventListener("input", () => { nameRequired = false; });
+  dobInput.addEventListener("change", () => { nameRequired = false; });
   function frame(now) {
     const dt = lastTime ? Math.min((now - lastTime) / 1000, .035) : 0;
     lastTime = now; update(dt); draw(); requestAnimationFrame(frame);
